@@ -1,0 +1,178 @@
+name: Test Kubeflow
+
+on:
+  - push
+  - pull_request
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checking out repo
+      uses: actions/checkout@v2
+
+    - name: Install lxd
+      run: |
+        set -eux
+        sudo snap install lxd
+        sudo lxd.migrate -yes
+        sudo lxd waitready
+        sudo lxd init --auto
+        sudo usermod --append --groups lxd $USER
+
+    - name: Install snapcraft
+      run: sudo snap install snapcraft --classic
+
+    - name: Build snap
+      run: sg lxd -c 'snapcraft --use-lxd'
+
+    - name: Uploading snap
+      uses: actions/upload-artifact@v2
+      with:
+        name: microk8s.snap
+        path: ./microk8s*.snap
+
+  test-actions:
+    name: Actions
+    runs-on: ubuntu-latest
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        bundle: [lite, edge]
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v2
+
+    - name: Download built snap
+      uses: actions/download-artifact@v2
+      with:
+        name: microk8s.snap
+
+    - name: Install snap
+      run: |
+        set -eux
+        sudo snap install ./microk8s*.snap --classic --dangerous
+        sudo usermod --append --groups microk8s $USER
+
+    - name: Enable kubeflow
+      run: |
+        set -eux
+        export KUBEFLOW_BUNDLE=${{ matrix.bundle }}
+        export KUBEFLOW_DEBUG=true
+        export KUBEFLOW_IGNORE_MIN_MEM=true
+        sg microk8s -c 'microk8s enable kubeflow'
+
+    - name: Test kubeflow
+      run: |
+        set -eux
+        # sudo apt update
+        # sudo apt install -y libssl-dev python3-setuptools
+        sudo pip3 install pytest sh kfp requests pyyaml
+        git clone https://github.com/juju-solutions/bundle-kubeflow.git
+        cd bundle-kubeflow
+        trap 'pkill -f svc/pipelines-api' SIGINT SIGTERM EXIT
+        microk8s kubectl -n kubeflow port-forward svc/pipelines-api 8888:8888 &
+        (i=10; while ! curl localhost:8888 ; do ((--i)) || exit; sleep 1; done)
+        pytest -vvs -m ${{ matrix.bundle }}
+
+    - name: Generate inspect tarball
+      run: >
+        sudo microk8s inspect |
+        grep -Po "Report tarball is at \K.+" |
+        sudo xargs -I {} mv {} inspection-report-${{ strategy.job-index }}.tar.gz
+      if: failure()
+
+    - name: Upload inspect tarball
+      uses: actions/upload-artifact@v2
+      with:
+        name: inspection-report
+        path: ./inspection-report-${{ strategy.job-index }}.tar.gz
+      if: failure()
+
+  test-aws:
+    name: AWS
+    runs-on: ubuntu-latest
+    needs: [build]
+    strategy:
+      fail-fast: false
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v2
+
+    - name: Download built snap
+      uses: actions/download-artifact@v2
+      with:
+        name: microk8s.snap
+
+    - name: Install dependencies
+      run: |
+        set -eux
+        sudo snap install juju --classic
+        sudo snap install juju-wait --classic
+
+    - name: Bootstrap onto AWS
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      run: |
+        set -eux
+        juju autoload-credentials --client aws
+        juju bootstrap aws/us-east-1 uk8saws --config test-mode=true --model-default test-mode=true
+        juju deploy ubuntu --constraints 'cores=4 mem=16G root-disk=60G'
+        juju wait -vw
+
+    - name: Copy snap to AWS instance
+      run: juju scp ./microk8s*.snap ubuntu/0:~/microk8s.snap
+
+    - name: Install snap
+      run: |
+        juju ssh ubuntu/0 <<EOF
+          set -eux
+          sudo snap install ./microk8s*.snap --classic --dangerous
+          sudo usermod --append --groups microk8s ubuntu
+        EOF
+
+    - name: Enable kubeflow
+      run: |
+        juju ssh ubuntu/0 <<EOF
+          set -eux
+          export KUBEFLOW_BUNDLE=${{ matrix.bundle }}
+          export KUBEFLOW_DEBUG=true
+          export KUBEFLOW_IGNORE_MIN_MEM=true
+          microk8s enable kubeflow
+        EOF
+
+    - name: Test kubeflow
+      run: |
+        juju ssh ubuntu/0 <<EOF
+          set -eux
+          # sudo apt update
+          # sudo apt install -y libssl-dev python3-setuptools
+          sudo pip3 install pytest sh kfp requests pyyaml
+          git clone https://github.com/juju-solutions/bundle-kubeflow.git
+          cd bundle-kubeflow
+          trap 'pkill -f svc/pipelines-api' SIGINT SIGTERM EXIT
+          microk8s kubectl -n kubeflow port-forward svc/pipelines-api 8888:8888 &
+          (i=10; while ! curl localhost:8888 ; do ((--i)) || exit; sleep 1; done)
+          pytest -vvs -m ${{ matrix.bundle }}
+        EOF
+
+    - name: Generate inspect tarball
+      run: |
+        juju ssh ubuntu/0 <<EOF
+          sudo microk8s inspect | \
+            grep -Po "Report tarball is at \K.+" | \
+            sudo xargs -I {} mv {} inspection-report-${{ strategy.job-index }}.tar.gz
+        EOF
+        juju scp ubuntu/0:~/inspection-report-${{ strategy.job-index }}.tar.gz .
+      if: failure()
+
+    - name: Upload inspect tarball
+      uses: actions/upload-artifact@v2
+      with:
+        name: inspection-report
+        path: ./inspection-report-${{ strategy.job-index }}.tar.gz
+      if: failure()
